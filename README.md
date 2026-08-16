@@ -12,21 +12,30 @@ Checked in this order — when a pose could match more than one, the earlier one
 
 | # | Gesture | How to trigger |
 |---|---|---|
-| 1 | Muehehe | Both hands up, index fingers only, tips touching |
-| 2 | Devo cat | Both hands up, above the top of your head |
-| 3 | Crash out cord chewing kitty | Both hands up beside your face to hold yummy electrical cable |
-| 4 | I will punch you | One hand, all four fingers curled |
-| 5 | EHHEHEEEHEEEE | Thumb + pinky out, rockstar cat |
-| 6 | Shhh silenced cat | Index finger only, tip resting on your mouth |
-| 7 | Erm ackshuALLY! cat | Index finger only, held away from your face |
-| 8 | Shocked/kidnapped cat | Hand cover mouth |
-| 9 | gGIMME MONIE!! | One open palm, all fingers extended, away from your face |
-| 10 | Side eye cat | Turn your head 15°+ either way (real head-pose yaw) |
-| 11 | Pokercat | Default |
-| 12 | Spinny OIIAI cat | You spin!!!! |
+| 1 | Spinny OIIAI cat | You spin!!!! (beats everything, hands included) |
+| 2 | Screaming cat | Mouth wide open (beats any hand pose) |
+| 3 | Muehehe | Both hands up, index fingers only, tips touching |
+| 4 | Devo cat | Both hands up, above the top of your head |
+| 5 | Crash out cord chewing kitty | Both hands up beside your face to hold yummy electrical cable |
+| 6 | I will punch you | One hand, all four fingers curled |
+| 7 | EHHEHEEEHEEEE | Thumb + pinky out, rockstar cat |
+| 8 | Shhh silenced cat | Index finger only, tip resting on your mouth |
+| 9 | Erm ackshuALLY! cat | Index finger only, held away from your face |
+| 10 | Shocked/kidnapped cat | Hand cover mouth |
+| 11 | gGIMME MONIE!! | One open palm, all fingers extended, away from your face |
+| 12 | Side eye cat | Turn your head 15°+ either way (real head-pose yaw) |
+| 13 | Huh? cat | Tilt your head 12°+ sideways (head-pose roll) |
+| 14 | Pokercat | Default |
 
+Meme images live in `memes/`. When a gesture has several images, it shows one
+per pose and moves to the next once you drop back to no gesture at all — so
+holding a pose never makes the image flicker, and repeating the pose walks
+through the whole set.
 
-Meme images live in `memes/`. A couple of gestures pick randomly between multiple images.
+A gesture whose image isn't in `memes/` is reported at startup and simply
+never fires, so a gesture can be wired up before its artwork exists. Screaming
+cat and Huh? cat are in this state — they detect and show up in the readout,
+but need `memes/screaming cat.jpg` and `memes/huh cat.jpg` added to display.
 
 ## Running it — desktop (Python)
 
@@ -59,14 +68,30 @@ Then open `http://localhost:8000` and allow camera access. Models load from Goog
 
 ## Live debug HUD
 
-The Camera window always shows a small readout in the top-left corner:
+The Camera window always shows a compact readout in the top-left corner. Each
+line after the gesture name is `value/threshold` for one of the signals that
+drive a gesture:
 
 ```
-gesture: sideEyeCat
-yaw: +18.4 deg  (side-eye thr +/-15.0)
+sideEyeCat
+yaw  +18.4/15
+roll  -2.1/12
+mouth 0.01/0.15
+hands 0 pt 0 gap 0.00/1.40
+flow 0.02/0.80
+spin 0.00/0.55  pk 0.00
 ```
 
-Useful for tuning the detection thresholds at the top of `gesture_meme.py` / `app.js` if a gesture is triggering too easily or not easily enough for your setup/lighting.
+`yaw` is head turn (side eye), `roll` is head tilt (huh?), `mouth` is lip gap
+over face height (screaming), `hands`/`pt`/`gap` are the hand count, how many
+hands read as pointing, and the gap between index tips (muehehe), and
+`flow`/`spin` are the optical-flow measures behind spin detection.
+
+Useful for tuning the detection thresholds at the top of `gesture_meme.py` /
+`app.js` if a gesture is triggering too easily or not easily enough for your
+setup/lighting. Every run also writes `flow_debug_log.csv` with all of these
+per frame, which is the easier way to tune a threshold: record yourself doing
+the gesture, then look at what the numbers actually reach.
 
 ## Project layout
 
@@ -74,7 +99,12 @@ Useful for tuning the detection thresholds at the top of `gesture_meme.py` / `ap
 gesture_meme.py   desktop version (OpenCV + MediaPipe Python tasks API)
 app.js            browser version (MediaPipe tasks-vision WASM)
 index.html        browser UI shell
-memes/            meme images (+ one video, unused for now)
+memes/            meme images, plus the spin cat video
 models/           MediaPipe .task model files used by the desktop version
 requirements.txt  Python dependencies
+flow_debug_log.csv  per-frame signal log, rewritten on every desktop run
 ```
+
+The two versions have drifted: the browser version does not have spin cat,
+screaming cat or huh? cat, and does not have the desktop version's threaded
+capture.
