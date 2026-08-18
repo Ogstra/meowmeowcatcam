@@ -134,13 +134,20 @@ SCREAM_MOUTH_OPEN = 0.15
 # Requiring reversals rather than raw speed is what keeps a hand that's
 # simply being moved across the frame from counting - that travels far but
 # only ever in one direction.
-WAVE_WINDOW_MS = 1300  # trailing window the reversals are counted over
+# 2000, not 1300: a slow, deliberate wave (~0.6Hz) has a swing period
+# longer than 1300ms, so two reversals never fit inside the shorter window
+# and it went undetected no matter how clearly it was performed.
+WAVE_WINDOW_MS = 2000  # trailing window the reversals are counted over
 # 2, not 3: a slow wave (~1Hz) only fits about two reversals in the window,
 # and 3 rejected those outright. 2 still rejects a hand crossing the frame,
 # a drifting hand and jitter, all of which produce none.
 WAVE_MIN_REVERSALS = 2
 WAVE_MIN_TRAVEL = 0.35  # per swing, in hand widths, so small jitter doesn't count
-WAVE_HOLD_MS = 700  # keep showing it briefly after the hand stops moving
+# Bridges both the pause at each turnaround and the frames a blurred hand
+# goes undetected, which is what made a fast wave break up into runs too
+# short to survive the debounce.
+WAVE_HOLD_MS = 1000  # keep showing it briefly after the hand stops moving
+WAVE_PALM_GRACE_MS = 500  # how long the palm can go unseen before the history is dropped
 
 # spin detection: full-frame optical flow, downsized for speed. We compute
 # magnitude (how much of the frame moved, on average) each frame; coherence
@@ -316,6 +323,7 @@ class GestureState:
         self.last_fingers_debug = ""
         self.wave_history = []  # [(t, palm_x, hand_scale), ...] while an open palm is up
         self.last_wave_at = float("-inf")  # not 0: that reads as "just waved" early on
+        self.last_open_palm_at = float("-inf")
         self.last_wave_reversals_debug = 0
         self.flow_history = []  # [(t, magnitude), ...] trailing samples, for the fraction-above trigger
         self.flow_peak_history = []  # [(t, score), ...] longer trailing window, for the readable peak display
@@ -354,12 +362,23 @@ class GestureState:
 
     def update_wave(self, hands, now):
         """Track a lone open palm's horizontal position, so is_waving can
-        look for it changing direction."""
+        look for it changing direction.
+
+        A frame without a clean open palm does NOT reset the history. Fast
+        waving is exactly when the hand blurs and the fingers momentarily
+        read as curled - or the hand isn't found at all - so discarding
+        everything on those frames threw away the very gesture it was
+        supposed to catch. Samples age out of the window on their own, and
+        the history is only dropped once the palm has been gone long enough
+        that it's clearly a different pose.
+        """
         open_palms = [h for h in hands if h["curledCount"] == 0]
         if len(open_palms) != 1:
-            self.wave_history = []  # not the pose at all - start clean
+            if now - self.last_open_palm_at > WAVE_PALM_GRACE_MS:
+                self.wave_history = []
             return
         h = open_palms[0]
+        self.last_open_palm_at = now
         self.wave_history.append((now, float(h["palmCenter"][0]), h["handScale"]))
         self.wave_history = [s for s in self.wave_history if now - s[0] < WAVE_WINDOW_MS]
 
