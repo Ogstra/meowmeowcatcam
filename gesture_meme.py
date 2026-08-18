@@ -20,6 +20,7 @@ Gestures:
   spin cat (spinning fast in your chair)                   -> memes/spin cat.mov (plays as a video)
   screaming (mouth wide open)                              -> memes/screaming cat.jpg
   huh? (head tilted sideways)                              -> memes/huh cat.jpg
+  waving an open hand                                      -> memes/hi-otag.gif (plays as a video)
 
 A gesture whose meme file isn't in memes/ yet is reported at startup and
 simply never fires, so new gestures can be wired up before their artwork
@@ -72,10 +73,12 @@ GESTURE_MEMES = {
     "spinCat": ["spin cat.mov"],
     "screamingCat": ["screaming cat.jpg"],
     "huhCat": ["huh cat.jpg"],
+    "waveHi": ["hi-otag.gif"],
 }
 
-# gestures whose meme is a video, not a still image
-VIDEO_GESTURES = {"spinCat"}
+# gestures whose meme is a video, not a still image (GIFs included - they
+# decode through VideoCapture the same way)
+VIDEO_GESTURES = {"spinCat", "waveHi"}
 
 STABLE_FRAMES_REQUIRED = 5
 DEFAULT_FALLBACK_MS = 600
@@ -122,6 +125,22 @@ HUH_ROLL_DEG = 12.0
 # wide-open scream runs past 0.15. Watch the live "mouth" readout in the
 # Camera window to tune it for your face.
 SCREAM_MOUTH_OPEN = 0.15
+
+# waving an open hand. An open palm on its own is already handStretchedOut,
+# so what separates a wave is the side-to-side motion: the palm has to keep
+# reversing direction. Horizontal travel is measured in hand-scale units so
+# it doesn't change with how far away you are.
+#
+# Requiring reversals rather than raw speed is what keeps a hand that's
+# simply being moved across the frame from counting - that travels far but
+# only ever in one direction.
+WAVE_WINDOW_MS = 1300  # trailing window the reversals are counted over
+# 2, not 3: a slow wave (~1Hz) only fits about two reversals in the window,
+# and 3 rejected those outright. 2 still rejects a hand crossing the frame,
+# a drifting hand and jitter, all of which produce none.
+WAVE_MIN_REVERSALS = 2
+WAVE_MIN_TRAVEL = 0.35  # per swing, in hand widths, so small jitter doesn't count
+WAVE_HOLD_MS = 700  # keep showing it briefly after the hand stops moving
 
 # spin detection: full-frame optical flow, downsized for speed. We compute
 # magnitude (how much of the frame moved, on average) each frame; coherence
@@ -295,6 +314,9 @@ class GestureState:
         self.last_pointing_debug = 0
         self.last_tip_gap_debug = 0.0
         self.last_fingers_debug = ""
+        self.wave_history = []  # [(t, palm_x, hand_scale), ...] while an open palm is up
+        self.last_wave_at = float("-inf")  # not 0: that reads as "just waved" early on
+        self.last_wave_reversals_debug = 0
         self.flow_history = []  # [(t, magnitude), ...] trailing samples, for the fraction-above trigger
         self.flow_peak_history = []  # [(t, score), ...] longer trailing window, for the readable peak display
         self.last_flow_magnitude_debug = 0.0
@@ -329,6 +351,47 @@ class GestureState:
         elevated = sum(1 for _, m in self.flow_history if m > SPIN_MAG_THRESHOLD)
         fraction = elevated / len(self.flow_history)
         return fraction > SPIN_FRACTION_REQUIRED
+
+    def update_wave(self, hands, now):
+        """Track a lone open palm's horizontal position, so is_waving can
+        look for it changing direction."""
+        open_palms = [h for h in hands if h["curledCount"] == 0]
+        if len(open_palms) != 1:
+            self.wave_history = []  # not the pose at all - start clean
+            return
+        h = open_palms[0]
+        self.wave_history.append((now, float(h["palmCenter"][0]), h["handScale"]))
+        self.wave_history = [s for s in self.wave_history if now - s[0] < WAVE_WINDOW_MS]
+
+    def is_waving(self, now):
+        """A wave is the palm reversing direction repeatedly, each swing
+        covering real ground.
+
+        Counting reversals rather than speed is deliberate: moving a hand
+        across the frame is fast and travels far, but only ever one way, so
+        it never accumulates reversals.
+        """
+        samples = [s for s in self.wave_history if now - s[0] < WAVE_WINDOW_MS]
+        reversals, direction, swing_start = 0, 0, None
+        for (_, x, scale) in samples:
+            if swing_start is None:
+                swing_start = x
+                continue
+            delta = x - swing_start
+            if abs(delta) < WAVE_MIN_TRAVEL * scale:
+                continue  # too small to call a swing yet - keep accumulating
+            new_direction = 1 if delta > 0 else -1
+            if direction and new_direction != direction:
+                reversals += 1
+            direction = new_direction
+            swing_start = x
+        self.last_wave_reversals_debug = reversals
+
+        if reversals >= WAVE_MIN_REVERSALS:
+            self.last_wave_at = now
+        # hold briefly: at the turnaround the palm is momentarily still, and
+        # without this the gesture would drop out on every swing
+        return now - self.last_wave_at < WAVE_HOLD_MS
 
     def update_face(self, face_result):
         now = time.time() * 1000
@@ -388,6 +451,7 @@ class GestureState:
 
         hands = [classify_hand(lm) for lm in hand_result.hand_landmarks]
         self.last_hands_debug = len(hands)
+        self.update_wave(hands, now)
 
         if len(hands) == 2:
             # recorded for tuning: how many hands read as pointing, and how
@@ -459,8 +523,12 @@ class GestureState:
             if d < threshold:
                 return "handCoverFace"
 
-        # open palm held out, not near the face
+        # open palm held out, not near the face. Waving one is checked first,
+        # since a wave is an open palm too - the motion is what tells them
+        # apart, so a still palm falls through to handStretchedOut.
         if h["curledCount"] == 0:
+            if self.is_waving(now):
+                return "waveHi"
             return "handStretchedOut"
 
         # hands are up but not making a specific shape - still allow a
@@ -507,6 +575,7 @@ def draw_debug_hud(frame, state, gesture):
         f"roll {state.last_roll_debug:+5.1f}/{HUH_ROLL_DEG:.0f}",
         f"mouth {state.last_mouth_open_debug:.2f}/{SCREAM_MOUTH_OPEN:.2f}",
         f"hands {state.last_hands_debug} pt {state.last_pointing_debug} gap {state.last_tip_gap_debug:.2f}/1.40",
+        f"wave {state.last_wave_reversals_debug}/{WAVE_MIN_REVERSALS}",
         f"flow {state.last_flow_magnitude_debug:.2f}/{SPIN_MAG_THRESHOLD:.2f}",
         f"spin {state.last_flow_fraction_debug:.2f}/{SPIN_FRACTION_REQUIRED:.2f}"
         f"  pk {state.last_flow_peak_debug:.2f}",
@@ -686,6 +755,7 @@ def detection_loop(
             f"{state.last_roll_debug:.2f},{int(state.face_seen_this_frame)},"
             f"{state.last_hands_debug},{state.last_pointing_debug},"
             f"{state.last_tip_gap_debug:.3f},{state.last_fingers_debug},"
+            f"{state.last_wave_reversals_debug},"
             f"{gesture},{current_gesture}\n"
         )
 
@@ -699,8 +769,7 @@ def detection_loop(
         if candidate_streak >= STABLE_FRAMES_REQUIRED and gesture != current_gesture:
             current_gesture = gesture
             if gesture in VIDEO_GESTURES:
-                if gesture == "spinCat":
-                    memes["_spin_restart"] = True
+                memes["_video_restart"] = gesture  # play from the start
             elif gesture in memes:
                 memes["_current"] = pick_meme(gesture)
             # else: gesture is wired up but its artwork isn't in memes/ yet
@@ -752,7 +821,7 @@ def main():
     # value is still a list of images.
     widest_meme_aspect = max(img.shape[1] / img.shape[0] for imgs in memes.values() for img in imgs)
     memes["_current"] = random.choice(memes["default"])
-    memes["_spin_restart"] = False
+    memes["_video_restart"] = None
 
     # every frame's flow numbers get logged here, timestamped - so we can
     # look at exactly what a real, full-effort spin looked like afterward
@@ -761,20 +830,30 @@ def main():
     flow_log = open(flow_log_path, "w", buffering=1)  # line-buffered so data survives a hard kill
     flow_log.write(
         "t_ms,magnitude,coherence,score,fraction,peak_2s,"
-        "mouth_open,yaw,roll,face_seen,hands,pointing,tip_gap,fingers,"
+        "mouth_open,yaw,roll,face_seen,hands,pointing,tip_gap,fingers,wave_rev,"
         "gesture_raw,gesture_shown\n"
     )
 
-    spin_video_cap = cv2.VideoCapture(str(MEMES / GESTURE_MEMES["spinCat"][0]))
-    if not spin_video_cap.isOpened():
-        raise FileNotFoundError(f"missing meme file: {MEMES / GESTURE_MEMES['spinCat'][0]}")
+    # one capture per video-backed gesture, streamed frame by frame in the
+    # display loop. GIFs decode through VideoCapture the same as .mov does.
+    video_caps = {}
+    for gesture in VIDEO_GESTURES:
+        path = MEMES / GESTURE_MEMES[gesture][0]
+        cap_v = cv2.VideoCapture(str(path))
+        if cap_v.isOpened():
+            video_caps[gesture] = cap_v
+        else:
+            print(f"[meme missing] {path} - '{gesture}' disabled until it's added")
 
-    def next_spin_frame():
-        ok, vframe = spin_video_cap.read()
-        if not ok:
-            spin_video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ok, vframe = spin_video_cap.read()
-        return vframe
+    def next_video_frame(gesture):
+        cap_v = video_caps.get(gesture)
+        if cap_v is None:
+            return None
+        ok, vframe = cap_v.read()
+        if not ok:  # loop
+            cap_v.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, vframe = cap_v.read()
+        return vframe if ok else None
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -866,11 +945,11 @@ def main():
                 draw_landmarks(frame, hand_result)
             draw_debug_hud(frame, state, current_gesture)
 
-            if current_gesture == "spinCat":
-                if memes["_spin_restart"]:
-                    spin_video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    memes["_spin_restart"] = False
-                vframe = next_spin_frame()
+            if current_gesture in VIDEO_GESTURES:
+                if memes["_video_restart"] == current_gesture:
+                    video_caps[current_gesture].set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    memes["_video_restart"] = None
+                vframe = next_video_frame(current_gesture)
                 meme_img = vframe if vframe is not None else memes["_current"]
             else:
                 meme_img = memes["_current"]
@@ -891,7 +970,8 @@ def main():
         cap_thread.join(timeout=1)
         det_thread.join(timeout=1)
         cap.release()
-        spin_video_cap.release()
+        for cap_v in video_caps.values():
+            cap_v.release()
         flow_log.close()
         cv2.destroyAllWindows()
         hand_landmarker.close()
