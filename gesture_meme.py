@@ -142,7 +142,11 @@ WAVE_WINDOW_MS = 2000  # trailing window the reversals are counted over
 # and 3 rejected those outright. 2 still rejects a hand crossing the frame,
 # a drifting hand and jitter, all of which produce none.
 WAVE_MIN_REVERSALS = 2
-WAVE_MIN_TRAVEL = 0.35  # per swing, in hand widths, so small jitter doesn't count
+# Per-swing travel is deliberately small so a short, tight wave still
+# registers; WAVE_MIN_SPAN below is what keeps noise out instead, since it
+# asks for ground covered rather than for any one swing to be big.
+WAVE_MIN_TRAVEL = 0.12  # per swing, in hand widths
+WAVE_MIN_SPAN = 0.30  # total left-right sweep across the window, in hand widths
 # Bridges both the pause at each turnaround and the frames a blurred hand
 # goes undetected, which is what made a fast wave break up into runs too
 # short to survive the debounce.
@@ -405,6 +409,18 @@ class GestureState:
             direction = new_direction
             swing_start = x
         self.last_wave_reversals_debug = reversals
+
+        # The per-swing threshold above has to stay small for a short wave
+        # to register at all, and at that size landmark noise alone starts
+        # producing reversals. What noise can't do is cover ground: it
+        # rattles around one spot. So also require the palm to have swept a
+        # real span across the window, which a small but deliberate wave
+        # clears easily and a jittering still hand never does.
+        if samples:
+            xs = [x for _, x, _ in samples]
+            span = (max(xs) - min(xs)) / samples[-1][2]
+            if span < WAVE_MIN_SPAN:
+                reversals = 0
 
         if reversals >= WAVE_MIN_REVERSALS:
             self.last_wave_at = now
