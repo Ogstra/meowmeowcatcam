@@ -73,6 +73,19 @@ filename to choose where it goes instead:
 .venv/bin/python3 gesture_meme.py --record demo.mp4
 ```
 
+Add `--audio` to record the microphone too:
+
+```bash
+.venv/bin/python3 gesture_meme.py --record --audio
+```
+
+Audio is captured to a separate WAV and merged into the video afterwards,
+since OpenCV's video writer has no audio support. That merge needs **ffmpeg**
+on your PATH (`brew install ffmpeg`) — it is the one dependency the launcher
+does not install for you. Without it the recording is still kept, just as a
+separate `.mp4` and `.wav` pair. macOS will ask for microphone permission the
+first time. If the mic is unavailable the video still records, silently.
+
 The meme pane changes width from meme to meme, but a video file needs one
 fixed size, so the recording letterboxes each meme into a pane wide enough
 for the widest one. Frames are paced against the clock rather than written

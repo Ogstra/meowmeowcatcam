@@ -33,7 +33,8 @@ they can all be tuned by eye. See SIDE_EYE_YAW_DEG, HUH_ROLL_DEG,
 SCREAM_MOUTH_OPEN and the SPIN_* constants below.
 
 Pass --record to save both windows, side by side, to a video file for as
-long as the program runs.
+long as the program runs, and --audio alongside it to include the
+microphone (that one also needs ffmpeg, to merge the two).
 
 Press q or ESC to quit.
 """
@@ -44,6 +45,7 @@ import random
 import subprocess
 import threading
 import time
+import wave
 from pathlib import Path
 
 import cv2
@@ -841,6 +843,91 @@ def detection_loop(
         shared_detection.set(hand_result, current_gesture)
 
 
+class AudioRecorder:
+    """Captures the microphone to a WAV alongside the video.
+
+    Kept as a separate file rather than fed into the video writer because
+    OpenCV's VideoWriter has no audio support at all; the two are muxed
+    together with ffmpeg once recording stops.
+
+    Samples are written straight to disk from the audio callback instead of
+    being buffered in memory - at 48kHz a long session would otherwise grow
+    without bound.
+    """
+
+    def __init__(self, path):
+        import sounddevice as sd  # imported lazily: only --audio needs it
+
+        device_info = sd.query_devices(kind="input")
+        self.samplerate = int(device_info["default_samplerate"])
+        self.channels = min(1, device_info["max_input_channels"]) or 1
+        self.path = path
+        self.lock = threading.Lock()
+        self.closed = False
+        self.frames = 0
+
+        self.wav = wave.open(str(path), "wb")
+        self.wav.setnchannels(self.channels)
+        self.wav.setsampwidth(2)  # int16
+        self.wav.setframerate(self.samplerate)
+
+        def callback(indata, frame_count, time_info, status):
+            with self.lock:
+                if self.closed:
+                    return
+                self.wav.writeframes(indata.tobytes())
+                self.frames += frame_count
+
+        self.stream = sd.InputStream(
+            samplerate=self.samplerate,
+            channels=self.channels,
+            dtype="int16",
+            callback=callback,
+        )
+        self.stream.start()
+
+    @property
+    def seconds(self):
+        return self.frames / self.samplerate
+
+    def close(self):
+        self.stream.stop()
+        self.stream.close()
+        with self.lock:
+            self.closed = True
+            self.wav.close()
+
+
+def mux_audio(video_path, audio_path):
+    """Combine the recorded video and audio into one file, in place.
+
+    Returns True on success. On failure the two source files are left
+    alone rather than deleted - a session that took effort to record
+    shouldn't be lost to a muxing problem.
+    """
+    merged = video_path.with_suffix(".muxed.mp4")
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error",
+             "-i", str(video_path), "-i", str(audio_path),
+             "-c:v", "copy", "-c:a", "aac", "-shortest", str(merged)],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"Could not merge audio ({e.__class__.__name__}) - keeping "
+              f"{video_path.name} and {audio_path.name} separately")
+        return False
+
+    if result.returncode != 0 or not merged.exists():
+        print(f"Could not merge audio - keeping {video_path.name} and "
+              f"{audio_path.name} separately\n{result.stderr.strip()}")
+        return False
+
+    merged.replace(video_path)
+    audio_path.unlink(missing_ok=True)
+    return True
+
+
 class SessionRecorder:
     """Records both windows, side by side, to one video file.
 
@@ -902,7 +989,7 @@ class SessionRecorder:
         return self.frames
 
 
-def main(record_path=None):
+def main(record_path=None, record_audio=False):
     hand_landmarker = HandLandmarker.create_from_options(
         HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=str(MODELS / "hand_landmarker.task")),
@@ -1002,7 +1089,7 @@ def main(record_path=None):
     cap_thread.start()
     det_thread.start()
 
-    recorder = None
+    recorder = audio = None
     try:
         # wait for the first camera frame so the window doesn't flash empty
         while shared_frame.get() is None and not stop_event.is_set():
@@ -1043,7 +1130,18 @@ def main(record_path=None):
         # camera frame has arrived
         if record_path is not None:
             recorder = SessionRecorder(record_path, cam_w, meme_max_w, display_h)
-            print(f"Recording to {record_path} - press q or Esc to stop")
+            if record_audio:
+                # audio failing is not a reason to lose the video, so fall
+                # back to a silent recording and say so
+                try:
+                    audio = AudioRecorder(record_path.with_suffix(".wav"))
+                    print(f"Recording video + microphone to {record_path}")
+                except Exception as e:
+                    print(f"Microphone unavailable ({type(e).__name__}: {e}) - "
+                          f"recording video only")
+            else:
+                print(f"Recording to {record_path}")
+            print("Press q or Esc to stop")
 
         while not stop_event.is_set():
             frame = shared_frame.get()
@@ -1087,6 +1185,9 @@ def main(record_path=None):
         stop_event.set()
         if recorder is not None:
             frames = recorder.close()
+            if audio is not None:
+                audio.close()
+                mux_audio(recorder.path, audio.path)
             print(f"Saved {frames} frames ({frames / RECORD_FPS:.1f}s) to {recorder.path}")
         cap_thread.join(timeout=1)
         det_thread.join(timeout=1)
@@ -1110,7 +1211,16 @@ if __name__ == "__main__":
              "program runs. Without a filename, writes a timestamped file in "
              "recordings/.",
     )
+    parser.add_argument(
+        "--audio",
+        action="store_true",
+        help="also record the microphone into the video (requires --record). "
+             "Needs ffmpeg to merge the two.",
+    )
     args = parser.parse_args()
+
+    if args.audio and args.record is None:
+        parser.error("--audio needs --record: there is no video to add sound to")
 
     path = None
     if args.record is not None:
@@ -1122,4 +1232,4 @@ if __name__ == "__main__":
             out_dir.mkdir(exist_ok=True)
             path = out_dir / f"session-{time.strftime('%Y%m%d-%H%M%S')}.mp4"
 
-    main(record_path=path)
+    main(record_path=path, record_audio=args.audio)
