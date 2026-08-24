@@ -32,9 +32,13 @@ yaw, head roll, mouth openness, and optical-flow magnitude/fraction), so
 they can all be tuned by eye. See SIDE_EYE_YAW_DEG, HUH_ROLL_DEG,
 SCREAM_MOUTH_OPEN and the SPIN_* constants below.
 
+Pass --record to save both windows, side by side, to a video file for as
+long as the program runs.
+
 Press q or ESC to quit.
 """
 
+import argparse
 import math
 import random
 import subprocess
@@ -152,6 +156,14 @@ WAVE_MIN_SPAN = 0.30  # total left-right sweep across the window, in hand widths
 # short to survive the debounce.
 WAVE_HOLD_MS = 1000  # keep showing it briefly after the hand stops moving
 WAVE_PALM_GRACE_MS = 500  # how long the palm can go unseen before the history is dropped
+
+# --record: frame rate the session video is written at, the gap drawn
+# between the two panes, and a cap on how many times one frame may be
+# repeated to fill a stall (without it, a long pause would balloon the
+# file with thousands of identical frames).
+RECORD_FPS = 30
+RECORD_GAP = 16
+RECORD_MAX_REPEAT = 15
 
 # spin detection: full-frame optical flow, downsized for speed. We compute
 # magnitude (how much of the frame moved, on average) each frame; coherence
@@ -829,7 +841,68 @@ def detection_loop(
         shared_detection.set(hand_result, current_gesture)
 
 
-def main():
+class SessionRecorder:
+    """Records both windows, side by side, to one video file.
+
+    Two things make this more than a VideoWriter call.
+
+    The frame has to be a constant size, but the Meme window is not: it
+    changes width with every meme. So the recording uses a fixed canvas
+    wide enough for the widest one and centres each meme in it - the same
+    letterboxing that was deliberately avoided on screen, which is fine
+    here because a video file has no window to resize.
+
+    And VideoWriter assumes a fixed frame rate, while the display loop runs
+    at whatever the camera and the machine manage. Writing one frame per
+    iteration would make playback run fast or slow depending on the
+    machine, so frames are paced against the clock instead: at most one per
+    interval, repeating the last one to fill a gap. The result plays back
+    at real speed.
+    """
+
+    def __init__(self, path, cam_w, meme_max_w, height, fps=RECORD_FPS):
+        self.gap = RECORD_GAP
+        self.cam_w, self.meme_max_w, self.height = cam_w, meme_max_w, height
+        self.width = cam_w + self.gap + meme_max_w
+        self.interval = 1000.0 / fps
+        self.path = path
+        self.frames = 0
+        self.next_due = None
+        self.writer = cv2.VideoWriter(
+            str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (self.width, height)
+        )
+        if not self.writer.isOpened():
+            raise RuntimeError(f"could not open {path} for recording")
+
+    def _compose(self, cam_view, meme_view):
+        canvas = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        canvas[0:cam_view.shape[0], 0:cam_view.shape[1]] = cam_view
+        mh, mw = meme_view.shape[:2]
+        x = self.cam_w + self.gap + (self.meme_max_w - mw) // 2
+        y = (self.height - mh) // 2
+        canvas[y:y + mh, x:x + mw] = meme_view
+        return canvas
+
+    def write(self, cam_view, meme_view, now):
+        if self.next_due is None:
+            self.next_due = now
+        if now < self.next_due:
+            return  # running ahead of the target rate - nothing due yet
+        frame = self._compose(cam_view, meme_view)
+        # a slow iteration can leave more than one interval unfilled; repeat
+        # the frame so the file's timeline matches the wall clock
+        repeats = min(int((now - self.next_due) // self.interval) + 1, RECORD_MAX_REPEAT)
+        for _ in range(repeats):
+            self.writer.write(frame)
+        self.frames += repeats
+        self.next_due += self.interval * repeats
+
+    def close(self):
+        self.writer.release()
+        return self.frames
+
+
+def main(record_path=None):
     hand_landmarker = HandLandmarker.create_from_options(
         HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=str(MODELS / "hand_landmarker.task")),
@@ -929,6 +1002,7 @@ def main():
     cap_thread.start()
     det_thread.start()
 
+    recorder = None
     try:
         # wait for the first camera frame so the window doesn't flash empty
         while shared_frame.get() is None and not stop_event.is_set():
@@ -964,6 +1038,13 @@ def main():
         cv2.moveWindow("Camera", LEFT, TOP)
         cv2.moveWindow("Meme", LEFT + cam_w + GAP, TOP)
 
+        # started here rather than at the top of main: the canvas size
+        # depends on the window sizes, which aren't known until the first
+        # camera frame has arrived
+        if record_path is not None:
+            recorder = SessionRecorder(record_path, cam_w, meme_max_w, display_h)
+            print(f"Recording to {record_path} - press q or Esc to stop")
+
         while not stop_event.is_set():
             frame = shared_frame.get()
             if frame is None:
@@ -994,6 +1075,8 @@ def main():
 
             cv2.imshow("Camera", frame)
             cv2.imshow("Meme", meme_view)
+            if recorder is not None:
+                recorder.write(frame, meme_view, time.time() * 1000)
 
             # no delay beyond what's needed to pump the GUI event loop - the
             # display rate is bounded by the camera thread, not by this wait
@@ -1002,6 +1085,9 @@ def main():
                 break
     finally:
         stop_event.set()
+        if recorder is not None:
+            frames = recorder.close()
+            print(f"Saved {frames} frames ({frames / RECORD_FPS:.1f}s) to {recorder.path}")
         cap_thread.join(timeout=1)
         det_thread.join(timeout=1)
         cap.release()
@@ -1014,4 +1100,26 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    parser.add_argument(
+        "--record",
+        nargs="?",
+        const="",  # bare --record: fall back to a timestamped name below
+        metavar="FILE",
+        help="record both windows side by side to FILE (.mp4) for as long as the "
+             "program runs. Without a filename, writes a timestamped file in "
+             "recordings/.",
+    )
+    args = parser.parse_args()
+
+    path = None
+    if args.record is not None:
+        if args.record:
+            path = Path(args.record).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            out_dir = ROOT / "recordings"
+            out_dir.mkdir(exist_ok=True)
+            path = out_dir / f"session-{time.strftime('%Y%m%d-%H%M%S')}.mp4"
+
+    main(record_path=path)

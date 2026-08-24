@@ -57,6 +57,28 @@ python3 gesture_meme.py
 
 Press `q` or `Esc` in the Camera window to quit.
 
+### Recording a session
+
+`--record` saves both windows, side by side, to one video for as long as the
+program runs:
+
+```bash
+.venv/bin/python3 gesture_meme.py --record
+```
+
+That writes a timestamped file into `recordings/` (git-ignored). Pass a
+filename to choose where it goes instead:
+
+```bash
+.venv/bin/python3 gesture_meme.py --record demo.mp4
+```
+
+The meme pane changes width from meme to meme, but a video file needs one
+fixed size, so the recording letterboxes each meme into a pane wide enough
+for the widest one. Frames are paced against the clock rather than written
+one per loop iteration, so the result plays back at real speed regardless of
+how fast the machine was running.
+
 ## Running it — browser
 
 No install needed, but the webcam API requires serving over HTTP (opening `index.html` directly as a `file://` URL will not get camera permission). From this folder:
